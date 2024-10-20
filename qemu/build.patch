@@ -1,0 +1,358 @@
+diff --git a/hw/usb/Kconfig b/hw/usb/Kconfig
+index 84bc7fbe36..bc7ca52446 100644
+--- a/hw/usb/Kconfig
++++ b/hw/usb/Kconfig
+@@ -151,3 +151,8 @@ config USB_DWC3
+ config XLNX_USB_SUBSYS
+     bool
+     select USB_DWC3
++
++config USB_TREADMILL
++    bool
++    default y
++    depends on USB
+diff --git a/hw/usb/dev-treadmill.c b/hw/usb/dev-treadmill.c
+new file mode 100644
+index 0000000000..38869e338f
+--- /dev/null
++++ b/hw/usb/dev-treadmill.c
+@@ -0,0 +1,314 @@
++/*
++ * hack.lu treadmill device emulation
++ *
++ * Copyright (c) 2024 FluxFingers.
++ * Copyright (c) 2006 CodeSourcery.
++ * Copyright (c) 2008 Samuel Thibault <samuel.thibault@ens-lyon.org>
++ * Written by Paul Brook, reused for FTDI by Samuel Thibault
++ *
++ * This code is licensed under the LGPL.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-types-crypto.h"
++#include "qemu/cutils.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
++#include "crypto/akcipher.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "hw/usb.h"
++#include "migration/vmstate.h"
++#include "desc.h"
++#include "qom/object.h"
++#include "trace.h"
++#include <dlfcn.h>
++#include <stdlib.h>
++
++#define SIG_SIZE 256
++#define FW_BUF_SIZE 8192
++
++struct USBTreadmillState {
++    USBDevice dev;
++    USBEndpoint *intr;
++    char *fw_ptr;
++    int64_t fw_size;
++    char fw_buf[FW_BUF_SIZE];
++};
++
++#define TYPE_USB_TREADMILL "usb-treadmill-dev"
++OBJECT_DECLARE_SIMPLE_TYPE(USBTreadmillState, USB_TREADMILL)
++
++enum {
++    STR_MANUFACTURER = 1,
++    STR_PRODUCT_TREADMILL,
++    STR_SERIALNUMBER,
++};
++
++static const USBDescStrings desc_strings = {
++    [STR_MANUFACTURER]       = "FLUXFINGERS",
++    [STR_PRODUCT_TREADMILL]  = "HACK.LU USB TREADMILL",
++    [STR_SERIALNUMBER]       = "1",
++};
++
++#define TREADMILL_IN_EP 1
++#define TREADMILL_OUT_EP 2
++
++#define TREADMILL_RESET 0
++#define TREADMILL_BEGIN_UPDATE 1
++#define TREADMILL_SEEK_UPDATE 2
++#define TREADMILL_COMMIT_UPDATE 3
++
++static const USBDescIface desc_iface0 = {
++    .bInterfaceNumber              = 0,
++    .bNumEndpoints                 = 2,
++    .bInterfaceClass               = 0xff,
++    .bInterfaceSubClass            = 0xff,
++    .bInterfaceProtocol            = 0xff,
++    .eps = (USBDescEndpoint[]) {
++        {
++            .bEndpointAddress      = USB_DIR_IN | TREADMILL_IN_EP,
++            .bmAttributes          = USB_ENDPOINT_XFER_BULK,
++            .wMaxPacketSize        = 64,
++        },{
++            .bEndpointAddress      = USB_DIR_OUT | TREADMILL_OUT_EP,
++            .bmAttributes          = USB_ENDPOINT_XFER_BULK,
++            .wMaxPacketSize        = 64,
++        },
++    }
++};
++
++static const USBDescDevice desc_device = {
++    .bcdUSB                        = 0x0200,
++    .bMaxPacketSize0               = 8,
++    .bNumConfigurations            = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces        = 1,
++            .bConfigurationValue   = 1,
++            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
++            .bMaxPower             = 50,
++            .nif = 1,
++            .ifs = &desc_iface0,
++        },
++    },
++};
++
++static const USBDesc desc_treadmill = {
++    .id = {
++        .idVendor          = 0x1337,
++        .idProduct         = 0x1337,
++        .bcdDevice         = 0x0400,
++        .iManufacturer     = STR_MANUFACTURER,
++        .iProduct          = STR_PRODUCT_TREADMILL,
++        .iSerialNumber     = STR_SERIALNUMBER,
++    },
++    .full = &desc_device,
++    .str  = desc_strings,
++};
++
++static void usb_treadmill_reset(USBTreadmillState *s)
++{
++    s->fw_size = 0;
++    s->fw_ptr = s->fw_buf;
++}
++
++static void usb_treadmill_handle_reset(USBDevice *dev)
++{
++    USBTreadmillState *s = USB_TREADMILL(dev);
++    usb_treadmill_reset(s);
++}
++
++const char UPDATE_KEY[] = "\x30\x82\x01\x22\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01\x05\x00\x03\x82\x01\x0f\x00\x30\x82\x01\x0a\x02\x82\x01\x01\x00\xc7\xee\xaf\x2c\xa2\x51\xe1\xfc\x19\xa0\xfa\xea\x65\x3f\x0e\x34\x6e\x56\xd7\x46\x52\x31\xab\xe2\x89\xe8\x22\x0d\x3e\x41\x66\x41\x85\xfc\x5d\x5d\x7f\xa4\x82\x96\x34\xb1\x5c\x10\xf8\x20\xa0\xd8\x78\xac\xe8\x33\xcb\xfd\x48\x43\x04\x4d\xf1\x30\x92\x92\x1d\x58\x32\xb9\xc0\x71\xf8\x6e\xbb\x38\x4e\xdb\x17\xa3\x1e\x29\x94\xed\x7a\xa8\x14\x32\xe0\x82\xbe\xff\x1b\xd2\x0c\xa3\xfa\xf9\x4c\xbb\xdd\xc3\x4d\xa3\x97\xc0\x01\x62\x0c\xe0\x5b\x97\x5b\x95\x07\x79\x14\x7a\xca\xb3\xc5\xa1\x82\xbc\xef\x87\xd5\xfe\xd6\xe8\x5b\x32\xde\xa6\x5a\xa2\x29\x36\xe4\xb7\xb9\x55\x2a\xb6\x05\x7c\x66\x02\x2a\x0a\x8e\xbd\x40\x21\x2c\x2d\x51\xba\x00\xb2\xcd\x9d\x6f\x4f\x37\xc8\x71\x44\x88\x8a\x47\xd1\xf5\x1f\x44\x5e\x6a\xc4\x72\x1a\xdb\xb1\xdd\x9d\xc4\xcd\xea\xc0\xad\xe4\x65\x7e\x07\x01\x51\x5b\xb0\xf2\xb4\x49\xb6\x5d\x99\x22\xe4\x48\xb9\x13\x30\x05\xe9\x09\x4a\x8f\xc2\x4c\xe6\x24\xf3\xfd\x9a\x5c\xe5\x8b\xdf\xf7\x44\xa1\x35\xb2\xd4\xb5\x44\xcb\x4a\x07\xb4\x03\x3d\xfd\x18\xbb\x59\x2e\xbb\xf2\xad\x7e\x49\x1f\x50\x6f\x1d\x69\x73\xe3\x54\x61\x4f\x45\x02\x03\x01\x00\x01";
++
++static int usb_treadmill_commit_update(USBTreadmillState *s)
++{
++    Error *err;
++    QCryptoAkCipherOptions opts = {
++        .alg = QCRYPTO_AKCIPHER_ALG_RSA,
++        .u.rsa = {
++            .hash_alg = QCRYPTO_HASH_ALG_SHA256,
++            .padding_alg = QCRYPTO_RSA_PADDING_ALG_PKCS1,
++        }
++    };
++    QCryptoAkCipher *ak = qcrypto_akcipher_new(&opts, QCRYPTO_AKCIPHER_KEY_TYPE_PUBLIC, (const uint8_t *) UPDATE_KEY, sizeof(UPDATE_KEY), &err);
++    if (!ak)
++        return -1;
++    if (qcrypto_akcipher_verify(ak, s->fw_buf, SIG_SIZE, s->fw_buf + SIG_SIZE, s->fw_size - SIG_SIZE, &err))
++        return -2;
++    void *libfw = dlopen("/usr/lib/libtreadmill-fw.so", RTLD_LOCAL | RTLD_NOW);
++    if (!libfw)
++        return -3;
++    void *fw_install_update = dlsym(libfw, "treadmill_fw_install_update");
++    if (!fw_install_update)
++        return -4;
++    ((void (*)(char *, size_t)) fw_install_update)(s->fw_buf, s->fw_size);
++    return 0;
++}
++
++static void usb_treadmill_handle_control(USBDevice *dev, USBPacket *p,
++                                      int request, int value, int index,
++                                      int length, uint8_t *data)
++{
++    USBTreadmillState *s = USB_TREADMILL(dev);
++    int ret;
++    short offset = value;
++
++    ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
++    if (ret >= 0)
++        return;
++
++    switch (request) {
++    case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
++        break;
++
++    case VendorDeviceRequest | TREADMILL_RESET:
++        usb_treadmill_reset(s);
++        break;
++
++    case VendorDeviceRequest | TREADMILL_BEGIN_UPDATE:
++        if (s->fw_size || value > FW_BUF_SIZE || value < SIG_SIZE)
++            goto fail;
++        s->fw_size = value;
++        break;
++
++    case VendorDeviceRequest | TREADMILL_SEEK_UPDATE:
++        if (!s->fw_size || offset > s->fw_size)
++            goto fail;
++        s->fw_ptr = &s->fw_buf[offset];
++        break;
++
++    case VendorDeviceRequest | TREADMILL_COMMIT_UPDATE:
++        if (!s->fw_size || usb_treadmill_commit_update(s))
++            goto fail;
++        usb_treadmill_reset(s);
++        break;
++
++    fail:
++    default:
++        p->status = USB_RET_STALL;
++        break;
++    }
++}
++
++static void usb_treadmill_handle_data(USBDevice *dev, USBPacket *p)
++{
++    USBTreadmillState *s = USB_TREADMILL(dev);
++    uint8_t devep = p->ep->nr;
++    struct iovec *iov;
++    int i;
++
++    switch (p->pid) {
++    case USB_TOKEN_OUT:
++        if (devep != TREADMILL_OUT_EP) {
++            goto fail;
++        }
++        if (!s->fw_size)
++            goto fail;
++        for (i = 0; i < p->iov.niov; i++) {
++            iov = p->iov.iov + i;
++            if (s->fw_ptr + iov->iov_len > s->fw_buf + s->fw_size)
++                goto fail;
++            memcpy(s->fw_ptr, iov->iov_base, iov->iov_len);
++            s->fw_ptr += iov->iov_len;
++        }
++        p->actual_length = p->iov.size;
++        break;
++
++    case USB_TOKEN_IN:
++        if (devep != TREADMILL_IN_EP) {
++            goto fail;
++        }
++
++        if (p->iov.size <= 2) {
++            p->status = USB_RET_NAK;
++            break;
++        }
++
++        usb_packet_copy(p, s->fw_ptr, MIN(p->iov.size, desc_iface0.eps[0].wMaxPacketSize));
++        break;
++
++    default:
++    fail:
++        p->status = USB_RET_STALL;
++        break;
++    }
++}
++
++static void usb_treadmill_realize(USBDevice *dev, Error **errp)
++{
++    USBTreadmillState *s = USB_TREADMILL(dev);
++    Error *local_err = NULL;
++
++    usb_desc_create_serial(dev);
++    usb_desc_init(dev);
++    dev->auto_attach = 0;
++
++    usb_check_attach(dev, &local_err);
++    if (local_err) {
++        error_propagate(errp, local_err);
++        return;
++    }
++
++    usb_treadmill_handle_reset(dev);
++    if (!dev->attached) {
++        usb_device_attach(dev, &error_abort);
++    }
++    s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
++}
++
++static const VMStateDescription vmstate_usb_treadmill = {
++    .name = "usb-treadmill",
++    .unmigratable = 1,
++};
++
++static Property treadmill_properties[] = {
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void usb_treadmill_dev_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++    uc->realize        = usb_treadmill_realize;
++    uc->handle_reset   = usb_treadmill_handle_reset;
++    uc->handle_control = usb_treadmill_handle_control;
++    uc->handle_data    = usb_treadmill_handle_data;
++    dc->vmsd = &vmstate_usb_treadmill;
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo usb_treadmill_dev_type_info = {
++    .name = TYPE_USB_TREADMILL,
++    .parent = TYPE_USB_DEVICE,
++    .instance_size = sizeof(USBTreadmillState),
++    .abstract = true,
++    .class_init = usb_treadmill_dev_class_init,
++};
++
++static void usb_treadmill_class_initfn(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++    uc->product_desc   = "hack.lu treadmill";
++    uc->usb_desc       = &desc_treadmill;
++    device_class_set_props(dc, treadmill_properties);
++}
++
++static const TypeInfo treadmill_info = {
++    .name          = "usb-treadmill",
++    .parent        = TYPE_USB_TREADMILL,
++    .class_init    = usb_treadmill_class_initfn,
++};
++
++
++static void usb_treadmill_register_types(void)
++{
++    type_register_static(&usb_treadmill_dev_type_info);
++    type_register_static(&treadmill_info);
++}
++
++type_init(usb_treadmill_register_types)
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index d7de1003e3..c18bf269df 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -45,6 +45,7 @@ system_ss.add(when: 'CONFIG_USB_STORAGE_UAS', if_true: files('dev-uas.c'))
+ system_ss.add(when: 'CONFIG_USB_AUDIO', if_true: files('dev-audio.c'))
+ system_ss.add(when: 'CONFIG_USB_SERIAL', if_true: files('dev-serial.c'))
+ system_ss.add(when: 'CONFIG_USB_NETWORK', if_true: files('dev-network.c'))
++system_ss.add(when: 'CONFIG_USB_TREADMILL', if_true: files('dev-treadmill.c'))
+ if host_os != 'windows'
+   system_ss.add(when: 'CONFIG_USB_STORAGE_MTP', if_true: files('dev-mtp.c'))
+ endif
+diff --git a/meson.build b/meson.build
+index fbda17c987..cfe7054e9a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -4161,7 +4161,7 @@ subdir('scripts')
+ subdir('tools')
+ subdir('pc-bios')
+ subdir('docs')
+-subdir('tests')
++#subdir('tests')
+ if gtk.found()
+   subdir('po')
+ endif

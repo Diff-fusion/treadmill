@@ -1,0 +1,61 @@
+# build qemu with
+# docker build --output=. -f Dockerfile.qemu .
+FROM debian:bookworm AS builder
+
+# install dependencies
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && \
+    DOCKER_FRONTEND=noninteractive apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    libcapstone-dev \
+    libgcrypt20-dev \
+    libglib2.0-dev \
+    libsdl2-dev \
+    libslirp-dev \
+    libpixman-1-dev \
+    libz-dev \
+    ncurses-dev \
+    ninja-build \
+    pkg-config \
+    python3 \
+    python3-pip \
+    wget \
+    zip
+
+RUN mkdir -p /build/build
+WORKDIR /build
+
+# get QEMU source
+ADD --chmod=0755 --checksum=sha256:9aa694556405351e1cfd71d64b30a71f3df8f52f18e1096cf639fa1a4992c70e \
+    https://github.com/qemu/qemu/archive/refs/tags/v9.1.0.zip \
+    /build/qemu.zip
+ADD build.patch /build/
+
+# load and patch QEMU
+RUN unzip qemu.zip && \
+    mv qemu-* qemu && \
+    cd qemu && \
+    git apply /build/build.patch
+
+# configure
+ADD run_configure.sh /build/build
+RUN cd build && \
+    ./run_configure.sh ../qemu
+
+# build
+RUN --mount=type=cache,target=/build/cache \
+    cp -r build/* cache/ && \
+    cd cache && \
+    ninja && \
+    cp qemu-bundle/usr/local/share/qemu/bios-256k.bin \
+       qemu-bundle/usr/local/share/qemu/efi-e1000.rom \
+       qemu-bundle/usr/local/share/qemu/vgabios-stdvga.bin \
+       qemu-bundle/usr/local/share/qemu/keymaps/en-us \
+       qemu-system-x86_64 \
+       ../
+
+# extract QEMU binary
+FROM scratch AS binary
+COPY --from=builder /build/qemu-system-x86_64 /build/bios-256k.bin /build/efi-e1000.rom /build/vgabios-stdvga.bin /build/en-us /
